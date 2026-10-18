@@ -82,7 +82,7 @@ export class PassengerSim {
     for (const st of stations) {
       const b = boardings.get(st.id) || 0;
       this.stationBoardings.set(st.id, b);
-      const scale = 1 + Math.min(2.2, b / 40);
+      const scale = 1 + Math.min(1.8, b / 45);
       st.mesh.scale.setScalar(scale);
     }
 
