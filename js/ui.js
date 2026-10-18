@@ -9,6 +9,8 @@ export class UI {
   constructor(game) {
     this.game = game;
     this.toastTimer = null;
+    this._ridershipHistory = [];
+    this._chartAccum = 0;
     this.bind();
   }
 
@@ -20,6 +22,7 @@ export class UI {
         g.setTool(btn.dataset.tool);
         document.querySelectorAll('.tool-btn[data-tool]').forEach((b) => b.classList.remove('active'));
         btn.classList.add('active');
+        this.updateBuildHints();
       });
     });
 
@@ -46,6 +49,25 @@ export class UI {
       g.snapNodes = e.target.checked;
     });
 
+    const gridSnap = document.getElementById('grid-snap');
+    if (gridSnap) {
+      gridSnap.addEventListener('change', (e) => {
+        g.gridSnap = e.target.checked;
+      });
+    }
+
+    const autoTd = document.getElementById('auto-topdown');
+    if (autoTd) {
+      autoTd.addEventListener('change', (e) => {
+        g.autoTopDownBuild = e.target.checked;
+      });
+    }
+
+    const undoBtn = document.getElementById('btn-undo');
+    if (undoBtn) {
+      undoBtn.addEventListener('click', () => g.undoTrack());
+    }
+
     document.getElementById('btn-peak').addEventListener('click', () => {
       g.togglePeak();
       document.getElementById('btn-peak').textContent = g.passenger.peak ? '时段：高峰' : '时段：平峰';
@@ -58,6 +80,7 @@ export class UI {
 
     document.getElementById('btn-topdown').addEventListener('click', () => {
       g.toggleTopDown();
+      document.getElementById('btn-topdown').textContent = g.topDown ? '俯视：开' : '俯视锁定';
     });
 
     document.getElementById('btn-save').addEventListener('click', () => g.save());
@@ -75,8 +98,41 @@ export class UI {
         g.network.cancelPending();
         this.hidePreview();
         help.classList.remove('open');
+        this.toast('已结束当前折线');
       }
+      // Undo: Z or Ctrl+Z (ignore when typing in inputs)
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      if (e.key === 'z' || e.key === 'Z' || ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z'))) {
+        e.preventDefault();
+        g.undoTrack();
+      }
+      // Shortcuts 1-4 for tools
+      if (e.key === '1') this._setToolBtn('select');
+      if (e.key === '2') this._setToolBtn('track');
+      if (e.key === '3') this._setToolBtn('station');
+      if (e.key === '4') this._setToolBtn('erase');
     });
+
+    this.updateBuildHints();
+  }
+
+  _setToolBtn(tool) {
+    const btn = document.querySelector(`.tool-btn[data-tool="${tool}"]`);
+    if (btn) btn.click();
+  }
+
+  updateBuildHints() {
+    const el = document.getElementById('build-hint');
+    if (!el) return;
+    const t = this.game.tool;
+    const map = {
+      select: '浏览：左键平移 · 右键旋转 · 滚轮缩放',
+      track: '铺轨：单击落点 · 黄圈=吸附 · Z撤销 · Esc结束',
+      station: '设站：点击靠近轨道的节点',
+      erase: '橡皮：点击节点删除（范围已加大）',
+    };
+    el.textContent = map[t] || '';
   }
 
   refreshLineList() {
@@ -133,6 +189,59 @@ export class UI {
     document.getElementById('stat-segments').textContent = String(net.segments.length);
     document.getElementById('stat-worst').textContent = s.worstSegment;
     document.getElementById('stat-growth').textContent = `${s.growthPct}%`;
+
+    // Congestion color on worst label
+    const worstEl = document.getElementById('stat-worst');
+    if (worstEl) {
+      const m = /(\d+)%/.exec(s.worstSegment || '');
+      const pct = m ? Number(m[1]) : 0;
+      worstEl.style.color = pct >= 85 ? '#ff6a6a' : pct >= 50 ? '#ffd060' : '#a8d0ff';
+    }
+  }
+
+  updateRidershipChart() {
+    const canvas = document.getElementById('ride-chart');
+    if (!canvas) return;
+    this._chartAccum += 1;
+    if (this._chartAccum < 8) return; // ~ every few frames at 60fps, light
+    this._chartAccum = 0;
+
+    const r = this.game.passenger.stats.ridership || 0;
+    this._ridershipHistory.push(r);
+    if (this._ridershipHistory.length > 48) this._ridershipHistory.shift();
+
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = 'rgba(12, 22, 42, 0.9)';
+    ctx.fillRect(0, 0, w, h);
+
+    const hist = this._ridershipHistory;
+    const max = Math.max(10, ...hist);
+    ctx.strokeStyle = '#5aa8ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    hist.forEach((v, i) => {
+      const x = (i / Math.max(1, hist.length - 1)) * (w - 4) + 2;
+      const y = h - 4 - (v / max) * (h - 10);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Fill under
+    if (hist.length > 1) {
+      ctx.lineTo(w - 2, h - 2);
+      ctx.lineTo(2, h - 2);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(60, 140, 255, 0.18)';
+      ctx.fill();
+    }
+
+    ctx.fillStyle = '#8eb8e8';
+    ctx.font = '10px sans-serif';
+    ctx.fillText('客运趋势', 6, 12);
   }
 
   showPreview(ev, methodId) {
@@ -152,10 +261,11 @@ export class UI {
     const msg = document.getElementById('preview-msg');
     msg.textContent = ev.message || '';
     msg.className = ev.blocked ? 'warn' : ev.ok === false ? 'warn' : 'ok';
+    box.classList.toggle('blocked', !!ev.blocked);
   }
 
   hidePreview() {
-    document.getElementById('build-preview').classList.remove('visible');
+    document.getElementById('build-preview').classList.remove('visible', 'blocked');
   }
 
   toast(text) {
@@ -164,8 +274,10 @@ export class UI {
     el.classList.remove('show');
     void el.offsetWidth;
     el.classList.add('show');
+    // Crowding toasts get danger style
+    el.classList.toggle('danger', text.includes('拥挤') || text.includes('⚠'));
     clearTimeout(this.toastTimer);
-    this.toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
+    this.toastTimer = setTimeout(() => el.classList.remove('show', 'danger'), 2600);
   }
 
   drawMinimap() {
@@ -174,7 +286,7 @@ export class UI {
     const w = canvas.width;
     const h = canvas.height;
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = '#0c1424';
+    ctx.fillStyle = '#0a1220';
     ctx.fillRect(0, 0, w, h);
 
     const map = (x, z) => ({
@@ -182,8 +294,7 @@ export class UI {
       py: ((z + 60) / 120) * h,
     });
 
-    // river hint
-    ctx.strokeStyle = '#3a70c0';
+    ctx.strokeStyle = '#3a78c8';
     ctx.lineWidth = 3;
     ctx.beginPath();
     for (let x = -60; x <= 60; x += 4) {
@@ -201,13 +312,14 @@ export class UI {
       if (!a || !b) continue;
       const line = net.getLine(s.lineId);
       let col = line?.color || '#fff';
-      if (s.congestion >= 0.85) col = '#e04040';
-      else if (s.congestion >= 0.5) col = '#e0c040';
-      else if (s.congestion > 0.05) col = '#40d060';
+      if (s.congestion >= 0.85) col = '#ff4040';
+      else if (s.congestion >= 0.65) col = '#f0a020';
+      else if (s.congestion >= 0.35) col = '#d0e040';
+      else if (s.congestion > 0.05) col = '#2ee06a';
       const pa = map(a.x, a.z);
       const pb = map(b.x, b.z);
       ctx.strokeStyle = col;
-      ctx.lineWidth = 2.5;
+      ctx.lineWidth = s.congestion >= 0.85 ? 3.5 : 2.5;
       ctx.beginPath();
       ctx.moveTo(pa.px, pa.py);
       ctx.lineTo(pb.px, pb.py);
@@ -216,9 +328,11 @@ export class UI {
 
     for (const st of net.getStations()) {
       const p = map(st.x, st.z);
-      ctx.fillStyle = '#e8f4ff';
+      const boarding = this.game.passenger.stationBoardings.get(st.id) || 0;
+      const r = 2.5 + Math.min(4, boarding / 40);
+      ctx.fillStyle = boarding > 80 ? '#ff8080' : boarding > 40 ? '#ffe080' : '#e8f4ff';
       ctx.beginPath();
-      ctx.arc(p.px, p.py, 3, 0, Math.PI * 2);
+      ctx.arc(p.px, p.py, r, 0, Math.PI * 2);
       ctx.fill();
     }
   }
