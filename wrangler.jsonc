@@ -1,0 +1,8 @@
+{
+  "name": "metro-sandbox",
+  "compatibility_date": "2026-10-18",
+  "assets": {
+    "directory": "."
+  },
+  "workers_dev": true
+}

@@ -3,7 +3,7 @@
  */
 import { capacityForFrequency } from './construction.js';
 
-const TRANSFER_PENALTY = 2.5; // 等价站数
+const TRANSFER_PENALTY = 2.5;
 const WALK_RADIUS = 14;
 
 export class PassengerSim {
@@ -11,7 +11,7 @@ export class PassengerSim {
     this.network = network;
     this.demandGrid = demandGrid;
     this.enabled = true;
-    this.peak = true; // 高峰
+    this.peak = true;
     this.stats = {
       ridership: 0,
       avgTransfers: 0,
@@ -30,11 +30,10 @@ export class PassengerSim {
     this.enabled = v;
   }
 
-  /** 每帧/定时调用；dt 秒 */
   update(dt) {
     if (!this.enabled) return;
     this._accum += dt;
-    if (this._accum < 0.5) return; // 2Hz
+    if (this._accum < 0.5) return;
     this._accum = 0;
     this.simulate();
     this.growCity(0.5);
@@ -51,12 +50,16 @@ export class PassengerSim {
     this.stationBoardings.clear();
 
     if (stations.length < 1) {
-      this.stats = { ridership: 0, avgTransfers: 0, worstSegment: '—', growthPct: this.stats.growthPct };
+      this.stats = {
+        ridership: 0,
+        avgTransfers: 0,
+        worstSegment: '—',
+        growthPct: this.stats.growthPct,
+      };
       this.network.applyCongestionColors();
       return;
     }
 
-    // 1) 站点吸引：需求格按距离分配
     const peakMul = this.peak ? 1.35 : 0.75;
     const boardings = new Map();
     for (const st of stations) boardings.set(st.id, 0);
@@ -78,15 +81,12 @@ export class PassengerSim {
       }
     }
 
-    // 站点视觉：按 boarding 缩放
     for (const st of stations) {
       const b = boardings.get(st.id) || 0;
       this.stationBoardings.set(st.id, b);
-      const scale = 1 + Math.min(2.2, b / 40);
-      st.mesh.scale.setScalar(scale);
+      st.visualScale = 1 + Math.min(1.8, b / 45);
     }
 
-    // 2) 构建换乘图：站点为节点；同线相邻站连边；同站多线换乘
     const graph = this.buildGraph(stations);
     if (graph.nodes.size < 2) {
       this.stats.ridership = Math.round([...boardings.values()].reduce((a, b) => a + b, 0));
@@ -95,7 +95,6 @@ export class PassengerSim {
       return;
     }
 
-    // 3) 简化 OD：每个有进站量的站，向其他站分配出行（按吸引比例）
     let totalTrips = 0;
     let totalTransfers = 0;
     const stationList = stations.map((s) => s.id);
@@ -115,7 +114,6 @@ export class PassengerSim {
         if (!path) continue;
         totalTrips += trips;
         totalTransfers += trips * path.transfers;
-        // 加载到路段
         for (const edge of path.edges) {
           const seg = segments.find((s) => s.id === edge.segId);
           if (seg) seg.load += trips;
@@ -123,7 +121,6 @@ export class PassengerSim {
       }
     }
 
-    // 4) 拥堵
     let worst = null;
     let worstC = 0;
     for (const s of segments) {
@@ -136,22 +133,20 @@ export class PassengerSim {
     }
     this.network.applyCongestionColors();
 
-    this.stats.ridership = Math.round(totalTrips || [...boardings.values()].reduce((a, b) => a + b, 0));
-    this.stats.avgTransfers = totalTrips > 0 ? Math.round((totalTransfers / totalTrips) * 100) / 100 : 0;
+    this.stats.ridership = Math.round(
+      totalTrips || [...boardings.values()].reduce((a, b) => a + b, 0)
+    );
+    this.stats.avgTransfers =
+      totalTrips > 0 ? Math.round((totalTransfers / totalTrips) * 100) / 100 : 0;
     this.stats.worstSegment = worst || '—';
   }
 
   buildGraph(stations) {
-    // nodeKey = stationId；边带 lineId / segId / cost
     const nodes = new Map();
-    for (const st of stations) {
-      nodes.set(st.id, []);
-    }
+    for (const st of stations) nodes.set(st.id, []);
 
-    // 每条线：按节点顺序找相邻站点对，沿线段链连接
     for (const line of this.network.lines) {
       const lineStations = line.stationIds.filter((id) => this.network.nodes.get(id)?.station);
-      // 用线段 BFS 找同线站点间路径成本
       const adj = new Map();
       for (const s of this.network.segments) {
         if (s.lineId !== line.id) continue;
@@ -165,7 +160,7 @@ export class PassengerSim {
         for (let j = i + 1; j < lineStations.length; j++) {
           const path = this._walkSegments(adj, lineStations[i], lineStations[j]);
           if (!path) continue;
-          const cost = path.segIds.length; // 站间段数
+          const cost = path.segIds.length;
           const congPenalty = path.segIds.reduce((acc, id) => {
             const seg = this.network.segments.find((s) => s.id === id);
             return acc + (seg && seg.congestion > 0.85 ? 0.5 : 0);
@@ -187,9 +182,6 @@ export class PassengerSim {
         }
       }
     }
-
-    // 换乘：同一物理站（已是同一 node id）多线——路径搜索时换 line 加惩罚
-    // 因为站点共享 id，换线在 Dijkstra 状态里处理
     return { nodes };
   }
 
@@ -222,12 +214,7 @@ export class PassengerSim {
     return null;
   }
 
-  /**
-   * Dijkstra：状态 (stationId, lineId|null)
-   * 第一次到达某站不计换乘；换线 +TRANSFER_PENALTY
-   */
   shortestPath(graph, origin, dest) {
-    // 简化：边已按站间给出；换乘 = 连续两边 lineId 不同
     const dist = new Map();
     const prev = new Map();
     const key0 = `${origin}|null`;
@@ -256,11 +243,7 @@ export class PassengerSim {
         const nd = cur.d + add;
         if (!dist.has(nk) || nd < dist.get(nk)) {
           dist.set(nk, nd);
-          prev.set(nk, {
-            from: cur.key,
-            edge,
-            transfers,
-          });
+          prev.set(nk, { from: cur.key, edge, transfers });
           push({ key: nk, d: nd, station: edge.to, lineId: edge.lineId });
         }
       }
@@ -285,10 +268,8 @@ export class PassengerSim {
     return { edges, transfers };
   }
 
-  /** 有地铁覆盖的格子缓慢增长 */
   growCity(dt) {
     const stations = this.network.getStations();
-    let grown = 0;
     let total = this.demandGrid.cells.length || 1;
     for (const cell of this.demandGrid.cells) {
       let covered = false;
@@ -301,7 +282,6 @@ export class PassengerSim {
       cell.covered = covered;
       if (covered) {
         cell.growth = Math.min(2.2, cell.growth + dt * 0.008);
-        grown++;
       } else {
         cell.growth = Math.min(1.15, cell.growth + dt * 0.0008);
       }

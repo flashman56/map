@@ -1,11 +1,14 @@
 /**
- * 地铁网络：线路、节点、站点、轨道渲染
+ * 地铁网络（纯数据 + 2D 绘制辅助）：线路、节点、站点、幽灵预览、撤销
  */
-import * as THREE from 'three';
 import { evaluateSegment, METHODS } from './construction.js';
-import { sampleHeight } from './world.js';
 
 const LINE_COLORS = ['#3aa0ff', '#ff5a5a', '#40d080', '#f0c040', '#c060ff', '#ff80c0', '#40e0e0', '#ff9040'];
+
+export const SNAP_RADIUS = 3.6;
+export const ERASE_RADIUS = 3.8;
+export const STATION_RADIUS = 4.2;
+export { METHODS };
 
 let _id = 1;
 export function nextId(prefix = 'id') {
@@ -16,27 +19,16 @@ export function resetIdCounter(n = 1) {
 }
 
 export class MetroNetwork {
-  constructor(scene) {
-    this.scene = scene;
-    this.group = new THREE.Group();
-    this.group.name = 'metro';
-    scene.add(this.group);
-
-    this.lines = []; // { id, name, color, frequency, nodeIds, stationIds }
-    this.nodes = new Map(); // id -> { id, x, z, y, station, mesh, lineIds }
-    this.segments = []; // { id, lineId, a, b, method, time, difficulty, mesh, load, capacity }
+  constructor() {
+    this.lines = [];
+    this.nodes = new Map();
+    this.segments = [];
     this.activeLineId = null;
-    this.pendingPath = []; // node ids being drawn
-    this.ghostLine = null;
-    this.previewMarker = null;
-
-    this.nodeMat = new THREE.MeshStandardMaterial({ color: 0xffffff, emissive: 0x335566, roughness: 0.4 });
-    this.stationMat = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      emissive: 0xaaccff,
-      emissiveIntensity: 0.6,
-      roughness: 0.35,
-    });
+    this.pendingPath = [];
+    this.ghost = null; // { x, z, fromX, fromZ, blocked, color, snapped }
+    this.snapTargetId = null;
+    this.undoStack = [];
+    this.highlightId = null;
   }
 
   createLine(color) {
@@ -46,7 +38,7 @@ export class MetroNetwork {
       id: nextId('line'),
       name: `${idx}号线`,
       color: c,
-      frequency: 'mid', // low | mid | high
+      frequency: 'mid',
       nodeIds: [],
       stationIds: [],
     };
@@ -67,13 +59,13 @@ export class MetroNetwork {
     this.activeLineId = id;
     this.pendingPath = [];
     this.clearGhost();
+    this.highlightId = null;
   }
 
   setLineColor(id, color) {
     const line = this.getLine(id);
     if (!line) return;
     line.color = color;
-    this.rebuildLineMeshes(id);
   }
 
   setFrequency(id, freq) {
@@ -82,12 +74,7 @@ export class MetroNetwork {
     line.frequency = freq;
   }
 
-  /** 世界坐标落点高度 */
-  groundY(x, z) {
-    return sampleHeight(x, z) * 0.15 + 0.6;
-  }
-
-  findNearbyNode(x, z, radius = 2.5) {
+  findNearbyNode(x, z, radius = SNAP_RADIUS) {
     let best = null;
     let bestD = radius;
     for (const n of this.nodes.values()) {
@@ -100,14 +87,40 @@ export class MetroNetwork {
     return best;
   }
 
+  resolveSnap(x, z, snapNodes = true, gridSnap = false) {
+    let node = null;
+    if (snapNodes) {
+      node = this.findNearbyNode(x, z, SNAP_RADIUS);
+      if (node) {
+        return {
+          x: node.x,
+          z: node.z,
+          node,
+          snapped: true,
+          snapDist: Math.hypot(node.x - x, node.z - z),
+        };
+      }
+    }
+    if (gridSnap) {
+      const g = 2;
+      x = Math.round(x / g) * g;
+      z = Math.round(z / g) * g;
+    }
+    return { x, z, node: null, snapped: false, snapDist: Infinity };
+  }
+
   addNode(x, z, opts = {}) {
-    const y = this.groundY(x, z);
     const id = opts.id || nextId('node');
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.45, 12, 12), this.nodeMat.clone());
-    mesh.position.set(x, y, z);
-    mesh.userData = { type: 'node', id };
-    this.group.add(mesh);
-    const node = { id, x, z, y, station: false, mesh, lineIds: new Set() };
+    const node = {
+      id,
+      x,
+      z,
+      y: 0,
+      station: !!opts.station,
+      lineIds: new Set(opts.lineIds || []),
+      visualScale: 1,
+      highlight: false,
+    };
     this.nodes.set(id, node);
     return node;
   }
@@ -117,29 +130,8 @@ export class MetroNetwork {
     if (!node) return null;
     if (node.station) return node;
     node.station = true;
-    // 换成站点样式
-    this.group.remove(node.mesh);
-    node.mesh.geometry.dispose();
-    const mesh = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.85, 0.95, 0.55, 16),
-      this.stationMat.clone()
-    );
-    mesh.position.set(node.x, node.y + 0.15, node.z);
-    mesh.userData = { type: 'station', id: node.id };
-    // 光环
-    const ring = new THREE.Mesh(
-      new THREE.RingGeometry(1.1, 1.45, 24),
-      new THREE.MeshBasicMaterial({ color: 0xaaddff, side: THREE.DoubleSide, transparent: true, opacity: 0.7 })
-    );
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.y = 0.05;
-    mesh.add(ring);
-    this.group.add(mesh);
-    node.mesh = mesh;
-
     const line = this.getActiveLine();
     if (line && !line.stationIds.includes(node.id)) line.stationIds.push(node.id);
-    // 所有经过该节点的线路也登记
     for (const lid of node.lineIds) {
       const L = this.getLine(lid);
       if (L && !L.stationIds.includes(node.id)) L.stationIds.push(node.id);
@@ -147,28 +139,26 @@ export class MetroNetwork {
     return node;
   }
 
-  /**
-   * 铺轨：从 last 到 (x,z)，使用当前工法
-   * @returns {{ success, eval, node } | { success:false, reason, eval }}
-   */
-  placeTrackPoint(x, z, methodId, snap = true) {
+  placeTrackPoint(x, z, methodId, snap = true, gridSnap = false) {
     const line = this.getActiveLine();
     if (!line) return { success: false, reason: '请先新建或选择线路' };
 
-    let node = snap ? this.findNearbyNode(x, z, 2.8) : null;
+    const resolved = this.resolveSnap(x, z, snap, gridSnap);
+    let node = resolved.node;
     if (!node) {
-      // 限制在地图内
-      if (Math.abs(x) > 58 || Math.abs(z) > 58) {
+      if (Math.abs(resolved.x) > 58 || Math.abs(resolved.z) > 58) {
         return { success: false, reason: '超出地图范围' };
       }
-      node = this.addNode(x, z);
+      node = this.addNode(resolved.x, resolved.z);
     }
 
     if (this.pendingPath.length === 0) {
       this.pendingPath.push(node.id);
       node.lineIds.add(line.id);
       if (!line.nodeIds.includes(node.id)) line.nodeIds.push(node.id);
-      return { success: true, node, started: true };
+      this.undoStack.push({ type: 'start', nodeId: node.id, created: !resolved.snapped });
+      this._highlightNode(node, true);
+      return { success: true, node, started: true, snapped: resolved.snapped };
     }
 
     const prevId = this.pendingPath[this.pendingPath.length - 1];
@@ -180,45 +170,93 @@ export class MetroNetwork {
       return { success: false, reason: ev.message, eval: ev };
     }
 
-    // 创建线段
-    this.addSegment(line, prev, node, methodId, ev);
+    const seg = this.addSegment(line, prev, node, methodId, ev);
     this.pendingPath.push(node.id);
     node.lineIds.add(line.id);
     if (!line.nodeIds.includes(node.id)) line.nodeIds.push(node.id);
-    return { success: true, node, eval: ev };
+    this.undoStack.push({
+      type: 'segment',
+      segId: seg.id,
+      nodeId: node.id,
+      createdNode: !resolved.snapped,
+      prevId,
+    });
+    this._highlightNode(node, true);
+    this._highlightNode(prev, false);
+    return { success: true, node, eval: ev, snapped: resolved.snapped };
+  }
+
+  undoLastNode() {
+    if (this.undoStack.length === 0 && this.pendingPath.length === 0) {
+      return { success: false, reason: '没有可撤销的节点' };
+    }
+    const last = this.undoStack.pop();
+    if (!last) {
+      this.pendingPath.pop();
+      this.clearGhost();
+      return { success: true };
+    }
+
+    if (last.type === 'start') {
+      this.pendingPath = this.pendingPath.filter((id) => id !== last.nodeId);
+      const node = this.nodes.get(last.nodeId);
+      if (node) this._highlightNode(node, false);
+      if (last.created && node && this._isOrphanNode(node.id)) {
+        this._removeNodeOnly(node.id);
+      }
+      this.clearGhost();
+      return { success: true, undid: 'start' };
+    }
+
+    if (last.type === 'segment') {
+      this.segments = this.segments.filter((s) => s.id !== last.segId);
+      this.pendingPath = this.pendingPath.filter((id) => id !== last.nodeId);
+      if (this.pendingPath.length === 0 && last.prevId) {
+        this.pendingPath.push(last.prevId);
+      } else if (this.pendingPath[this.pendingPath.length - 1] !== last.prevId && last.prevId) {
+        while (this.pendingPath.length && this.pendingPath[this.pendingPath.length - 1] !== last.prevId) {
+          this.pendingPath.pop();
+        }
+        if (!this.pendingPath.length) this.pendingPath.push(last.prevId);
+      }
+
+      const node = this.nodes.get(last.nodeId);
+      if (node) this._highlightNode(node, false);
+      const prev = this.nodes.get(last.prevId);
+      if (prev) this._highlightNode(prev, true);
+
+      if (last.createdNode && node && this._isOrphanNode(node.id)) {
+        this._removeNodeOnly(node.id);
+      }
+      this.clearGhost();
+      return { success: true, undid: 'segment' };
+    }
+    return { success: false };
+  }
+
+  _isOrphanNode(nodeId) {
+    return !this.segments.some((s) => s.a === nodeId || s.b === nodeId);
+  }
+
+  _removeNodeOnly(nodeId) {
+    this.nodes.delete(nodeId);
+    for (const line of this.lines) {
+      line.nodeIds = line.nodeIds.filter((id) => id !== nodeId);
+      line.stationIds = line.stationIds.filter((id) => id !== nodeId);
+    }
+  }
+
+  _highlightNode(node, on) {
+    if (!node) return;
+    node.highlight = !!on;
+    this.highlightId = on ? node.id : this.highlightId === node.id ? null : this.highlightId;
   }
 
   addSegment(line, a, b, methodId, ev) {
-    // 避免完全重复
     const exists = this.segments.find(
       (s) => s.lineId === line.id && ((s.a === a.id && s.b === b.id) || (s.a === b.id && s.b === a.id))
     );
     if (exists) return exists;
-
-    const curvePts = this._segmentPoints(a, b, methodId);
-    const curve = new THREE.CatmullRomCurve3(curvePts);
-    const color = new THREE.Color(line.color);
-    const mat = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.95,
-    });
-    // 发光近似：再加一层稍粗半透明管
-    const tube = new THREE.Mesh(new THREE.TubeGeometry(curve, 16, 0.28, 6, false), mat);
-    tube.userData = { type: 'segment' };
-    const glowMat = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: 0.25,
-      depthWrite: false,
-    });
-    const glow = new THREE.Mesh(new THREE.TubeGeometry(curve, 16, 0.55, 6, false), glowMat);
-    glow.userData = { type: 'segmentGlow' };
-
-    const wrap = new THREE.Group();
-    wrap.add(tube);
-    wrap.add(glow);
-    this.group.add(wrap);
 
     const seg = {
       id: nextId('seg'),
@@ -226,171 +264,120 @@ export class MetroNetwork {
       a: a.id,
       b: b.id,
       method: methodId,
-      time: ev.time,
-      difficulty: ev.difficulty,
-      length: ev.length,
-      mesh: wrap,
-      tube,
-      glow,
+      time: ev?.time ?? 0,
+      difficulty: ev?.difficulty ?? 0,
       load: 0,
       capacity: 80,
       congestion: 0,
     };
     this.segments.push(seg);
-
-    // 建造中短暂缩放动画感：用 opacity 闪一下
-    tube.material.opacity = 0.3;
-    setTimeout(() => {
-      if (tube.material) tube.material.opacity = 0.95;
-    }, Math.min(2000, ev.time * 40));
-
+    a.lineIds.add(line.id);
+    b.lineIds.add(line.id);
     return seg;
   }
 
-  _segmentPoints(a, b, methodId) {
-    const mid = new THREE.Vector3((a.x + b.x) / 2, 0, (a.z + b.z) / 2);
-    let yLift = 0.9;
-    if (methodId === 'elevated') yLift = 2.2;
-    if (methodId === 'bridge') yLift = 2.8;
-    if (methodId === 'mountain_tunnel' || methodId === 'shield') yLift = 0.35;
-    if (methodId === 'cut_cover') yLift = 0.55;
-
-    const ay = a.y + (methodId === 'elevated' || methodId === 'bridge' ? 1.4 : 0.2);
-    const by = b.y + (methodId === 'elevated' || methodId === 'bridge' ? 1.4 : 0.2);
-    mid.y = (ay + by) / 2 + yLift * 0.3;
-
-    // 隧道略埋入
-    if (methodId === 'mountain_tunnel' || methodId === 'shield') {
-      mid.y = Math.min(ay, by) - 0.8;
-    }
-    if (methodId === 'bridge') {
-      mid.y = Math.max(ay, by) + 1.5;
-    }
-
-    return [
-      new THREE.Vector3(a.x, ay, a.z),
-      mid,
-      new THREE.Vector3(b.x, by, b.z),
-    ];
-  }
-
-  updateGhost(x, z, methodId) {
-    this.clearGhost();
-    if (this.pendingPath.length === 0) {
-      const m = new THREE.Mesh(
-        new THREE.SphereGeometry(0.5, 10, 10),
-        new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 })
-      );
-      m.position.set(x, this.groundY(x, z), z);
-      this.group.add(m);
-      this.ghostLine = m;
+  updateGhost(x, z, methodId, snap = true, gridSnap = false) {
+    const line = this.getActiveLine();
+    if (!line || this.pendingPath.length === 0) {
+      // 仍显示吸附圈
+      const resolved = this.resolveSnap(x, z, snap, gridSnap);
+      this.ghost = {
+        x: resolved.x,
+        z: resolved.z,
+        fromX: null,
+        fromZ: null,
+        blocked: false,
+        color: line?.color || '#3aa0ff',
+        snapped: resolved.snapped,
+        eval: null,
+      };
+      this.snapTargetId = resolved.node?.id || null;
       return null;
     }
+
     const prev = this.nodes.get(this.pendingPath[this.pendingPath.length - 1]);
-    const line = this.getActiveLine();
-    const ev = evaluateSegment(prev.x, prev.z, x, z, methodId);
-    const color = ev.blocked ? 0xff4050 : new THREE.Color(line?.color || '#ffffff').getHex();
-    const pts = this._segmentPoints(
-      prev,
-      { x, z, y: this.groundY(x, z) },
-      methodId
-    );
-    const curve = new THREE.CatmullRomCurve3(pts);
-    const mesh = new THREE.Mesh(
-      new THREE.TubeGeometry(curve, 12, 0.22, 5, false),
-      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.55 })
-    );
-    this.group.add(mesh);
-    this.ghostLine = mesh;
+    if (!prev) {
+      this.clearGhost();
+      return null;
+    }
+    const resolved = this.resolveSnap(x, z, snap, gridSnap);
+    const ev = evaluateSegment(prev.x, prev.z, resolved.x, resolved.z, methodId);
+    this.ghost = {
+      x: resolved.x,
+      z: resolved.z,
+      fromX: prev.x,
+      fromZ: prev.z,
+      blocked: !!ev.blocked,
+      color: ev.blocked ? '#ff4040' : line.color,
+      snapped: resolved.snapped,
+      eval: ev,
+      method: methodId,
+    };
+    this.snapTargetId = resolved.node?.id || null;
     return ev;
   }
 
   clearGhost() {
-    if (this.ghostLine) {
-      this.group.remove(this.ghostLine);
-      this.ghostLine.geometry?.dispose?.();
-      this.ghostLine.material?.dispose?.();
-      this.ghostLine = null;
-    }
+    this.ghost = null;
+    this.snapTargetId = null;
   }
 
   cancelPending() {
+    for (const id of this.pendingPath) {
+      const n = this.nodes.get(id);
+      if (n) this._highlightNode(n, false);
+    }
     this.pendingPath = [];
+    this.undoStack = [];
     this.clearGhost();
   }
 
-  eraseNear(x, z, radius = 2.5) {
+  eraseNear(x, z, radius = ERASE_RADIUS) {
     const node = this.findNearbyNode(x, z, radius);
     if (!node) return false;
-    // 删除相关线段
-    const toRemove = this.segments.filter((s) => s.a === node.id || s.b === node.id);
-    for (const s of toRemove) {
-      this.group.remove(s.mesh);
-      s.tube.geometry.dispose();
-      s.glow.geometry.dispose();
-      this.segments = this.segments.filter((x) => x.id !== s.id);
-    }
-    this.group.remove(node.mesh);
-    node.mesh.geometry?.dispose?.();
-    this.nodes.delete(node.id);
+    const id = node.id;
+    this.segments = this.segments.filter((s) => s.a !== id && s.b !== id);
+    this.nodes.delete(id);
     for (const line of this.lines) {
-      line.nodeIds = line.nodeIds.filter((id) => id !== node.id);
-      line.stationIds = line.stationIds.filter((id) => id !== node.id);
+      line.nodeIds = line.nodeIds.filter((nid) => nid !== id);
+      line.stationIds = line.stationIds.filter((nid) => nid !== id);
     }
-    this.pendingPath = this.pendingPath.filter((id) => id !== node.id);
+    this.pendingPath = this.pendingPath.filter((nid) => nid !== id);
+    this.undoStack = [];
+    this.clearGhost();
     return true;
-  }
-
-  rebuildLineMeshes(lineId) {
-    const line = this.getLine(lineId);
-    if (!line) return;
-    const color = new THREE.Color(line.color);
-    for (const s of this.segments) {
-      if (s.lineId !== lineId) continue;
-      // 拥堵色优先，无负载时用线路色
-      if (s.congestion <= 0.05) {
-        s.tube.material.color.copy(color);
-        s.glow.material.color.copy(color);
-      }
-    }
-  }
-
-  /** 按拥堵更新线段颜色 green→yellow→red，混入线路色 */
-  applyCongestionColors() {
-    for (const s of this.segments) {
-      const c = s.congestion; // 0~1+
-      const line = this.getLine(s.lineId);
-      const base = new THREE.Color(line?.color || '#ffffff');
-      let congestionColor;
-      if (c < 0.5) congestionColor = new THREE.Color(0x40d060);
-      else if (c < 0.85) congestionColor = new THREE.Color(0xe0c040);
-      else congestionColor = new THREE.Color(0xe04040);
-      // 有客流时偏向拥堵色，否则线路色
-      const mix = Math.min(1, c * 1.2);
-      const out = base.clone().lerp(congestionColor, mix);
-      s.tube.material.color.copy(out);
-      s.glow.material.color.copy(out);
-      s.glow.material.opacity = 0.2 + Math.min(0.45, c * 0.4);
-    }
   }
 
   getStations() {
     return [...this.nodes.values()].filter((n) => n.station);
   }
 
-  /** 序列化 */
+  applyCongestionColors() {
+    // 2D：拥堵色在绘制时读取 seg.congestion，此处仅作占位兼容
+  }
+
+  /** 路段中点插值（供列车） */
+  segmentLerp(seg, t) {
+    const a = this.nodes.get(seg.a);
+    const b = this.nodes.get(seg.b);
+    if (!a || !b) return null;
+    const tt = Math.max(0, Math.min(1, t));
+    return {
+      x: a.x + (b.x - a.x) * tt,
+      z: a.z + (b.z - a.z) * tt,
+      angle: Math.atan2(b.z - a.z, b.x - a.x),
+    };
+  }
+
   toJSON() {
     return {
-      version: 1,
-      idCounter: _id,
-      activeLineId: this.activeLineId,
       lines: this.lines.map((l) => ({
         id: l.id,
         name: l.name,
         color: l.color,
         frequency: l.frequency,
-        nodeIds: l.nodeIds,
-        stationIds: l.stationIds,
+        nodeIds: [...l.nodeIds],
+        stationIds: [...l.stationIds],
       })),
       nodes: [...this.nodes.values()].map((n) => ({
         id: n.id,
@@ -407,36 +394,24 @@ export class MetroNetwork {
         method: s.method,
         time: s.time,
         difficulty: s.difficulty,
-        length: s.length,
       })),
+      activeLineId: this.activeLineId,
+      nextId: _id,
     };
   }
 
-  clearNetwork() {
-    for (const s of this.segments) {
-      this.group.remove(s.mesh);
-      s.tube.geometry.dispose();
-      s.glow.geometry.dispose();
-    }
-    for (const n of this.nodes.values()) {
-      this.group.remove(n.mesh);
-      n.mesh.geometry?.dispose?.();
-    }
-    this.segments = [];
-    this.nodes.clear();
-    this.lines = [];
-    this.pendingPath = [];
-    this.clearGhost();
-    this.activeLineId = null;
-  }
-
   fromJSON(data) {
-    this.clearNetwork();
-    if (data.idCounter) resetIdCounter(data.idCounter);
+    if (!data) return;
+    this.lines = [];
+    this.nodes.clear();
+    this.segments = [];
+    this.pendingPath = [];
+    this.undoStack = [];
+    this.clearGhost();
+    resetIdCounter(data.nextId || 1);
+
     for (const n of data.nodes || []) {
-      const node = this.addNode(n.x, n.z, { id: n.id });
-      node.lineIds = new Set(n.lineIds || []);
-      if (n.station) this.makeStation(node.id);
+      this.addNode(n.x, n.z, { id: n.id, station: n.station, lineIds: n.lineIds || [] });
     }
     for (const l of data.lines || []) {
       this.lines.push({
@@ -444,25 +419,151 @@ export class MetroNetwork {
         name: l.name,
         color: l.color,
         frequency: l.frequency || 'mid',
-        nodeIds: l.nodeIds || [],
-        stationIds: l.stationIds || [],
+        nodeIds: [...(l.nodeIds || [])],
+        stationIds: [...(l.stationIds || [])],
       });
     }
     for (const s of data.segments || []) {
-      const line = this.getLine(s.lineId);
-      const a = this.nodes.get(s.a);
-      const b = this.nodes.get(s.b);
-      if (!line || !a || !b) continue;
-      const ev = {
-        time: s.time,
-        difficulty: s.difficulty,
-        length: s.length || Math.hypot(a.x - b.x, a.z - b.z),
-      };
-      const seg = this.addSegment(line, a, b, s.method, ev);
-      seg.id = s.id;
+      this.segments.push({
+        id: s.id,
+        lineId: s.lineId,
+        a: s.a,
+        b: s.b,
+        method: s.method,
+        time: s.time || 0,
+        difficulty: s.difficulty || 0,
+        load: 0,
+        capacity: 80,
+        congestion: 0,
+      });
     }
     this.activeLineId = data.activeLineId || this.lines[0]?.id || null;
   }
-}
 
-export { METHODS, LINE_COLORS };
+  /**
+   * 绘制路网到 canvas（已处于屏幕像素坐标变换中：调用方传入 worldToScreen）
+   */
+  draw(ctx, toScreen, zoom, time = 0) {
+    // 路段
+    for (const seg of this.segments) {
+      const a = this.nodes.get(seg.a);
+      const b = this.nodes.get(seg.b);
+      if (!a || !b) continue;
+      const line = this.getLine(seg.lineId);
+      let col = line?.color || '#ffffff';
+      const cong = seg.congestion || 0;
+      if (cong >= 0.85) col = '#ff4040';
+      else if (cong >= 0.65) col = '#f0a020';
+      else if (cong >= 0.35) col = '#d0e040';
+      else if (cong > 0.05) col = '#2ee06a';
+
+      const pa = toScreen(a.x, a.z);
+      const pb = toScreen(b.x, b.z);
+      const lw = Math.max(3, 4.5 * (zoom / 8));
+
+      // 外发光
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = cong >= 0.85 ? 0.35 + 0.25 * Math.sin(time * 8) : 0.35;
+      ctx.lineWidth = lw + 4;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(pa.sx, pa.sy);
+      ctx.lineTo(pb.sx, pb.sy);
+      ctx.stroke();
+
+      // 主线
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = col;
+      ctx.lineWidth = lw;
+      ctx.beginPath();
+      ctx.moveTo(pa.sx, pa.sy);
+      ctx.lineTo(pb.sx, pb.sy);
+      ctx.stroke();
+
+      // 工法细条（虚线风格区分）
+      if (seg.method === 'bridge' || seg.method === 'mountain_tunnel' || seg.method === 'shield') {
+        ctx.setLineDash([6, 5]);
+        ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+        ctx.lineWidth = Math.max(1, lw * 0.35);
+        ctx.beginPath();
+        ctx.moveTo(pa.sx, pa.sy);
+        ctx.lineTo(pb.sx, pb.sy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // 幽灵预览
+    if (this.ghost) {
+      const g = this.ghost;
+      if (g.fromX != null) {
+        const pa = toScreen(g.fromX, g.fromZ);
+        const pb = toScreen(g.x, g.z);
+        ctx.strokeStyle = g.color;
+        ctx.globalAlpha = 0.85;
+        ctx.lineWidth = Math.max(3, 4 * (zoom / 8));
+        ctx.setLineDash([8, 6]);
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(pa.sx, pa.sy);
+        ctx.lineTo(pb.sx, pb.sy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+      }
+      const p = toScreen(g.x, g.z);
+      // 吸附黄圈
+      if (g.snapped) {
+        ctx.strokeStyle = '#ffe080';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, 12, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.fillStyle = g.blocked ? '#ff5050' : g.color;
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // 节点
+    for (const n of this.nodes.values()) {
+      const p = toScreen(n.x, n.z);
+      if (n.station) {
+        const r = (7 + Math.min(6, (n.visualScale - 1) * 4)) * Math.min(1.2, zoom / 7);
+        // 脉冲
+        if (n.visualScale > 1.3) {
+          ctx.strokeStyle = 'rgba(168,216,255,0.45)';
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.arc(p.sx, p.sy, r + 4 + Math.sin(time * 3) * 2, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.fillStyle = n.highlight ? '#ffe080' : '#ffffff';
+        ctx.strokeStyle = n.highlight ? '#ffc040' : '#3a90d8';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        // 换乘标记：多线
+        if (n.lineIds.size > 1) {
+          ctx.fillStyle = '#1a3050';
+          ctx.font = 'bold 10px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('换', p.sx, p.sy);
+        }
+      } else {
+        const r = 4 * Math.min(1.2, zoom / 7);
+        ctx.fillStyle = n.highlight ? '#ffe080' : '#e8f4ff';
+        ctx.strokeStyle = n.highlight ? '#ffc040' : 'rgba(100,160,220,0.8)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(p.sx, p.sy, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
+    }
+  }
+}
