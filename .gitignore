@@ -1,0 +1,17 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Local env (static CDN app; none expected)
+.env
+.env.*
+
+# Optional local tooling
+node_modules/
+dist/

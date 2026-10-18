@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>架空城市地铁建设沙盒</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="canvas-wrap"></div>
+
+    <header id="topbar">
+      <h1>架空城市地铁沙盒 <span class="brand-sub">MVP 原型</span></h1>
+      <button class="btn" id="btn-peak" title="切换时段">时段：高峰</button>
+      <button class="btn" id="btn-sim" title="开关客流模拟">模拟：开</button>
+      <button class="btn" id="btn-topdown">俯视锁定</button>
+      <button class="btn" id="btn-save">存档</button>
+      <button class="btn" id="btn-load">读档</button>
+      <button class="btn" id="btn-help">帮助</button>
+    </header>
+
+    <aside id="toolbox">
+      <h2>建造工具</h2>
+      <div class="group">
+        <button class="tool-btn active" data-tool="select">选择 / 浏览</button>
+        <button class="tool-btn" data-tool="track">铺轨</button>
+        <button class="tool-btn" data-tool="station">设站</button>
+        <button class="tool-btn" data-tool="erase">橡皮（删节点）</button>
+      </div>
+      <div class="group">
+        <label>当前线路</label>
+        <select id="line-select"></select>
+        <button class="btn primary" id="btn-new-line" style="width:100%;margin-top:4px">＋ 新建线路</button>
+        <label style="margin-top:6px">线路颜色</label>
+        <input type="color" id="line-color" value="#3aa0ff" />
+      </div>
+      <div class="group">
+        <label>施工工法</label>
+        <select id="method-select">
+          <option value="elevated">高架（平原）</option>
+          <option value="bridge">桥梁（跨河）</option>
+          <option value="mountain_tunnel">山隧（穿山）</option>
+          <option value="shield">盾构（城区地下）</option>
+          <option value="cut_cover">明挖（浅埋）</option>
+        </select>
+        <div class="method-hint" id="method-hint">平原开阔区首选，代价最低。</div>
+      </div>
+      <div class="group">
+        <label><input type="checkbox" id="snap-nodes" checked /> 吸附已有节点</label>
+      </div>
+    </aside>
+
+    <aside id="sidepanel">
+      <div class="panel" id="panel-lines">
+        <h2>线路列表</h2>
+        <div id="line-list"></div>
+      </div>
+      <div class="panel" id="panel-stats">
+        <h2>客流摘要</h2>
+        <div class="stat"><span>日均客运（相对）</span><span id="stat-ridership">0</span></div>
+        <div class="stat"><span>平均换乘次数</span><span id="stat-transfers">0</span></div>
+        <div class="stat"><span>站点数量</span><span id="stat-stations">0</span></div>
+        <div class="stat"><span>路段数量</span><span id="stat-segments">0</span></div>
+        <div class="stat"><span>最堵路段</span><span id="stat-worst">—</span></div>
+        <div class="stat"><span>城市发展</span><span id="stat-growth">0%</span></div>
+      </div>
+      <div class="panel" id="panel-legend">
+        <h2>图例</h2>
+        <div class="legend">
+          <i style="background:#4a7a3a"></i><span>平原 / 普通土</span>
+          <i style="background:#c4a060"></i><span>软土 / 淤泥</span>
+          <i style="background:#7a7a7a"></i><span>硬岩</span>
+          <i style="background:#3a70c0"></i><span>河流</span>
+          <i style="background:#8b6b4a"></i><span>山地</span>
+          <i style="background:#606878"></i><span>高密度城区</span>
+          <i style="background:#40d060"></i><span>拥堵：舒适</span>
+          <i style="background:#e0c040"></i><span>拥堵：偏满</span>
+          <i style="background:#e04040"></i><span>拥堵：拥挤</span>
+        </div>
+      </div>
+    </aside>
+
+    <div id="build-preview">
+      <div class="title" id="preview-title">施工预览</div>
+      <div class="bars">
+        <div class="bar-row">
+          <span class="label">建造耗时</span>
+          <div class="bar-track"><div class="bar-fill time" id="bar-time" style="width:20%"></div></div>
+          <span class="val" id="val-time">—</span>
+        </div>
+        <div class="bar-row">
+          <span class="label">难度点数</span>
+          <div class="bar-track"><div class="bar-fill diff" id="bar-diff" style="width:20%"></div></div>
+          <span class="val" id="val-diff">—</span>
+        </div>
+      </div>
+      <div id="preview-msg" class="ok"></div>
+    </div>
+
+    <div id="toast"></div>
+
+    <div id="minimap">
+      <span class="cap">2D 线路图</span>
+      <canvas id="minimap-canvas" width="180" height="140"></canvas>
+    </div>
+
+    <div id="help-modal">
+      <div class="card">
+        <button class="btn close" id="help-close">关闭</button>
+        <h2>操作说明</h2>
+        <ul>
+          <li><b>旋转</b>：右键拖拽　<b>平移</b>：中键 / Shift+左键　<b>缩放</b>：滚轮</li>
+          <li><b>新建线路</b> → 选颜色 → 选「铺轨」→ 左键逐点落轨；Esc 结束当前折线</li>
+          <li><b>设站</b>：选工具后点击已有节点或靠近轨道处</li>
+          <li><b>工法</b>：跨河用桥梁、穿山用山隧、高密度城区优先盾构；错误工法会提高难度/耗时，极端情况会阻止建造</li>
+          <li><b>发车频率</b>：线路列表中低/中/高，影响运力与拥堵颜色</li>
+          <li><b>城市发展</b>：有地铁覆盖的区域会缓慢提高需求</li>
+          <li>无胜负条件，自由建造沙盒。存档保存在浏览器 localStorage。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
